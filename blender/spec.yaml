@@ -109,6 +109,57 @@ setup:
         HOME=/home/agent setpriv --reuid=1000 --regid=1000 --init-groups \
           sh -c "cd $REPO_DIR/mcp && uv sync --quiet"
 
+    # Register the server with the sandbox's agent CLI, following the same
+    # install-time pattern the stock claude kit uses for its MCP gateway.
+    # Install commands are synchronous PostStart hooks that finish during
+    # `sbx create`, before the CLI attaches and launches the session; startup
+    # commands run from a detached dispatcher that can fire after the session
+    # has already read its config. Claude Code reads MCP config once at launch,
+    # so registering only at startup left it with no Blender tools.
+    #
+    # The script is written here rather than under `files:` because init files
+    # are written after install commands run.
+    - command: |
+        set -e
+        BIN_DIR="$HOME/.local/bin"
+        mkdir -p "$BIN_DIR"
+        cat > "$BIN_DIR/blender-mcp-register" <<'REGISTER'
+        #!/bin/sh
+        # Strictly additive: never remove-then-add. Neither CLI's `mcp add` is an
+        # idempotent rewrite (claude exits 1 on an existing name), so a re-run is
+        # expected to fail and `|| true` leaves the existing entry alone. Removing
+        # first would delete the entry out from under a live session for the ~0.6s
+        # the two CLI calls take.
+        PATH="$HOME/.local/bin:$HOME/.claude/local:/usr/local/share/npm-global/bin:$PATH"
+        export PATH
+        MCP_DIR=/home/agent/blender_mcp/mcp
+        NAME=blender
+
+        if [ ! -d "$MCP_DIR" ]; then
+          echo "blender-mcp-register: $MCP_DIR is missing" >&2
+          exit 1
+        fi
+
+        found=0
+        if command -v claude >/dev/null 2>&1; then
+          found=1
+          claude mcp add --scope user "$NAME" -- uv --directory "$MCP_DIR" run blender-mcp || true
+          echo "blender-mcp-register: claude registration attempted for '$NAME'"
+        fi
+        if command -v codex >/dev/null 2>&1; then
+          found=1
+          codex mcp add "$NAME" -- uv --directory "$MCP_DIR" run blender-mcp || true
+          echo "blender-mcp-register: codex registration attempted for '$NAME'"
+        fi
+        if [ "$found" -eq 0 ]; then
+          echo "blender-mcp-register: no claude or codex CLI found, nothing to configure"
+          echo "blender-mcp-register: launch manually with: uv --directory $MCP_DIR run blender-mcp"
+        fi
+        REGISTER
+        chmod 0755 "$BIN_DIR/blender-mcp-register"
+        "$BIN_DIR/blender-mcp-register"
+      user: "agent"
+
   files:
     - path: /home/agent/.local/bin/blender
       mode: "0755"
@@ -146,64 +197,18 @@ setup:
         # saved online-access preference is ever reset.
         exec /usr/bin/blender --gpu-backend opengl --online-mode "$@"
 
-    - path: /home/agent/.local/bin/blender-mcp-register
-      mode: "0755"
-      description: Registers the Blender MCP server with the sandbox's agent CLI, if it has one.
-      content: |
-        #!/bin/sh
-        # Re-registers on every container start because an agent's config can be
-        # re-seeded when the sandbox restarts.
-        PATH="/home/agent/.local/bin:/usr/local/share/npm-global/bin:$PATH"
-        export PATH
-        MCP_DIR=/home/agent/blender_mcp/mcp
-        NAME=blender
-
-        # setpriv drops privileges without touching HOME, and both CLIs resolve
-        # their config from it, so without this the entry lands in /root.
-        HOME_DIR=$(getent passwd 1000 | cut -d: -f6)
-        if [ -z "$HOME_DIR" ]; then
-          echo "blender-mcp-register: no user at uid 1000" >&2
-          exit 1
-        fi
-        export HOME="$HOME_DIR"
-
-        if [ ! -d "$MCP_DIR" ]; then
-          echo "blender-mcp-register: $MCP_DIR is missing" >&2
-          exit 1
-        fi
-
-        registered=0
-        if command -v claude >/dev/null 2>&1; then
-          claude mcp remove --scope user "$NAME" >/dev/null 2>&1 || true
-          if claude mcp add --scope user "$NAME" -- uv --directory "$MCP_DIR" run blender-mcp; then
-            echo "blender-mcp-register: added '$NAME' to claude (user scope)"
-            registered=1
-          fi
-        fi
-        if command -v codex >/dev/null 2>&1; then
-          codex mcp remove "$NAME" >/dev/null 2>&1 || true
-          if codex mcp add "$NAME" -- uv --directory "$MCP_DIR" run blender-mcp; then
-            echo "blender-mcp-register: added '$NAME' to codex"
-            registered=1
-          fi
-        fi
-        if [ "$registered" -eq 0 ]; then
-          echo "blender-mcp-register: no claude or codex CLI found, nothing to configure"
-          echo "blender-mcp-register: launch manually with: uv --directory $MCP_DIR run blender-mcp"
-        fi
-
   startup:
+    # Fallback only. The install-time registration above is the race-free path;
+    # this re-runs it in case that could not happen (for example the `--clone`
+    # workspace mode). The script is non-destructive, so firing concurrently
+    # with a live session can never take the entry away.
     - command:
-        - setpriv
-        - --reuid=1000
-        - --regid=1000
-        - --init-groups
-        - /bin/sh
+        - sh
         - -c
-        - exec /home/agent/.local/bin/blender-mcp-register >>/tmp/blender-mcp-register.log 2>&1
-      user: "0"
+        - /home/agent/.local/bin/blender-mcp-register >>/tmp/blender-mcp-register.log 2>&1 || true
+      user: "agent"
       description: |
-        Point the sandbox's agent CLI at the Blender MCP server. A no-op for
+        Re-point the sandbox's agent CLI at the Blender MCP server. A no-op for
         agents without a CLI (such as the plain shell agent), in which case the
         server is still installed and can be launched by hand.
 
