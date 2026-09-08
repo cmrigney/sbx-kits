@@ -1,0 +1,317 @@
+schemaVersion: "2"
+kind: mixin
+name: blender
+displayName: Blender
+permissions:
+  network:
+    allow:
+      - projects.blender.org:443
+      - extensions.blender.org:443
+      # The MCP server's Python dependencies.
+      - pypi.org:443
+      - files.pythonhosted.org:443
+setup:
+  install:
+    # Blender loads libwayland-client/cursor/egl, libdecor and libGL with dlopen
+    # at runtime, so apt does not pull them in as dependencies; without them
+    # GHOST drops the Wayland back-end and fails over to a non-existent X11
+    # display. The sandbox has no GPU, so Mesa's llvmpipe (OpenGL 4.5) supplies
+    # the OpenGL 4.3+ context Blender requires.
+    #
+    # python3-numpy is a hard requirement of the bundled io_scene_fbx add-on
+    # (`import numpy` at module scope) that the blender package does not depend
+    # on, so without it every FBX import/export path dies with
+    # ModuleNotFoundError. This Blender links against the system Python 3.14,
+    # so the distro package lands on its sys.path (/usr/lib/python3/dist-packages)
+    # and needs no pip or virtualenv. See agentInstructions: FBX export still
+    # has to bypass the operator even once numpy is present.
+    - command: |
+        set -eux
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y \
+          blender \
+          python3-numpy \
+          libwayland-client0 \
+          libwayland-cursor0 \
+          libwayland-egl1 \
+          libdecor-0-0 \
+          libdecor-0-plugin-1-gtk \
+          libxkbcommon0 \
+          libegl1 \
+          libegl-mesa0 \
+          libgl1 \
+          libopengl0 \
+          libglx0 \
+          libglx-mesa0 \
+          libgbm1 \
+          libgl1-mesa-dri
+        rm -rf /var/lib/apt/lists/*
+
+    # Blender Lab's MCP server add-on: https://www.blender.org/lab/mcp-server/
+    # Installed into uid 1000's extension directory so the GUI session started
+    # below picks it up, with online access enabled because the add-on refuses
+    # to open its socket otherwise.
+    - command: |
+        set -eux
+        ADDON_URL=https://projects.blender.org/lab/blender_mcp/releases/download/v1.0.0/mcp-1.0.0.zip
+        curl -fsSL -o /tmp/mcp-addon.zip "$ADDON_URL"
+
+        # The add-on declares blender_version_min = 5.1.0, but 5.0.1 from the
+        # Ubuntu archive is the newest Blender obtainable here: upstream ships
+        # Linux builds for x86_64 only and this sandbox is arm64. The add-on
+        # touches no API newer than 5.0, so lower the floor to let it install.
+        # Delete this rewrite once Blender >= 5.1 is installable on arm64.
+        python3 - <<'PY'
+        import zipfile
+        src, dst = "/tmp/mcp-addon.zip", "/tmp/mcp-addon-relaxed.zip"
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename.endswith("blender_manifest.toml"):
+                    data = data.replace(b'blender_version_min = "5.1.0"',
+                                        b'blender_version_min = "5.0.0"')
+                zout.writestr(item, data)
+        PY
+
+        HOME=/home/agent setpriv --reuid=1000 --regid=1000 --init-groups \
+          /usr/bin/blender --background --online-mode --python-expr '
+        import bpy
+        prefs = bpy.context.preferences
+        prefs.system.use_online_access = True
+        bpy.ops.extensions.package_install_files(
+            filepath="/tmp/mcp-addon-relaxed.zip", repo="user_default", enable_on_install=True)
+        if "bl_ext.user_default.mcp" not in prefs.addons:
+            raise SystemExit("MCP add-on failed to register")
+        bpy.ops.wm.save_userpref()
+        '
+        rm -f /tmp/mcp-addon.zip /tmp/mcp-addon-relaxed.zip
+
+    # MCP server, per https://projects.blender.org/lab/blender_mcp/wiki/Setup:
+    # clone the repo and let clients launch it with `uv run` over stdio. It is
+    # the client side of the add-on's bridge, so it is a plain library checkout
+    # rather than a service.
+    - command: |
+        set -eux
+        REPO_DIR=/home/agent/blender_mcp
+        git clone --depth 1 https://projects.blender.org/lab/blender_mcp.git "$REPO_DIR"
+
+        # The project asks for mcp[cli]>=1.2.0 with no upper bound, but mcp 2.x
+        # renamed FastMCP to MCPServer, so an unpinned resolve installs a version
+        # the server cannot import. Constrain it inside the checkout so the
+        # re-sync that `uv run` performs on each launch stays on 1.x.
+        printf '\n[tool.uv]\nconstraint-dependencies = ["mcp<2"]\n' >> "$REPO_DIR/mcp/pyproject.toml"
+
+        chown -R 1000:1000 "$REPO_DIR"
+
+        # Build the virtualenv now so a client spawning the server over stdio
+        # gets a fast, network-free start.
+        HOME=/home/agent setpriv --reuid=1000 --regid=1000 --init-groups \
+          sh -c "cd $REPO_DIR/mcp && uv sync --quiet"
+
+  files:
+    - path: /home/agent/.local/bin/blender
+      mode: "0755"
+      description: Launch wrapper written at each startup so WORKSPACE_DIR is resolved at runtime.
+      content: |
+        #!/bin/sh
+        DISPLAY_DIR=/run/display
+        DISPLAY_SOCK=wayland-0
+        if [ ! -S "$DISPLAY_DIR/$DISPLAY_SOCK" ]; then
+          echo "blender: display socket not found at $DISPLAY_DIR/$DISPLAY_SOCK" >&2
+          echo "This sandbox was not created with --display." >&2
+          echo "" >&2
+          echo "To fix, enable the experimental display feature and recreate:" >&2
+          echo "  sbx settings set platform.allowExperimentalFeatures true" >&2
+          echo "  sbx settings set feature.sandbox-display true" >&2
+          echo "  sbx create --display --kit <this-kit> shell <workspace>" >&2
+          exit 1
+        fi
+        HOME_DIR=$(getent passwd 1000 | cut -d: -f6)
+        if [ -z "$HOME_DIR" ]; then
+          echo "blender: no user at uid 1000" >&2
+          exit 1
+        fi
+        export HOME="$HOME_DIR"
+        # A relative WAYLAND_DISPLAY resolved against XDG_RUNTIME_DIR works on
+        # every libwayland; bare absolute socket paths need libwayland >= 1.21.
+        export XDG_RUNTIME_DIR="$DISPLAY_DIR"
+        export WAYLAND_DISPLAY="$DISPLAY_SOCK"
+        export LIBGL_ALWAYS_SOFTWARE=1
+        export GALLIUM_DRIVER=llvmpipe
+        LAUNCH_DIR="$WORKSPACE_DIR"
+        if [ -z "$LAUNCH_DIR" ]; then LAUNCH_DIR="$HOME_DIR"; fi
+        cd "$LAUNCH_DIR" || exit 1
+        # --online-mode keeps the MCP add-on's socket permitted even if the
+        # saved online-access preference is ever reset.
+        exec /usr/bin/blender --gpu-backend opengl --online-mode "$@"
+
+    - path: /home/agent/.local/bin/blender-mcp-register
+      mode: "0755"
+      description: Registers the Blender MCP server with the sandbox's agent CLI, if it has one.
+      content: |
+        #!/bin/sh
+        # Re-registers on every container start because an agent's config can be
+        # re-seeded when the sandbox restarts.
+        PATH="/home/agent/.local/bin:/usr/local/share/npm-global/bin:$PATH"
+        export PATH
+        MCP_DIR=/home/agent/blender_mcp/mcp
+        NAME=blender
+
+        # setpriv drops privileges without touching HOME, and both CLIs resolve
+        # their config from it, so without this the entry lands in /root.
+        HOME_DIR=$(getent passwd 1000 | cut -d: -f6)
+        if [ -z "$HOME_DIR" ]; then
+          echo "blender-mcp-register: no user at uid 1000" >&2
+          exit 1
+        fi
+        export HOME="$HOME_DIR"
+
+        if [ ! -d "$MCP_DIR" ]; then
+          echo "blender-mcp-register: $MCP_DIR is missing" >&2
+          exit 1
+        fi
+
+        registered=0
+        if command -v claude >/dev/null 2>&1; then
+          claude mcp remove --scope user "$NAME" >/dev/null 2>&1 || true
+          if claude mcp add --scope user "$NAME" -- uv --directory "$MCP_DIR" run blender-mcp; then
+            echo "blender-mcp-register: added '$NAME' to claude (user scope)"
+            registered=1
+          fi
+        fi
+        if command -v codex >/dev/null 2>&1; then
+          codex mcp remove "$NAME" >/dev/null 2>&1 || true
+          if codex mcp add "$NAME" -- uv --directory "$MCP_DIR" run blender-mcp; then
+            echo "blender-mcp-register: added '$NAME' to codex"
+            registered=1
+          fi
+        fi
+        if [ "$registered" -eq 0 ]; then
+          echo "blender-mcp-register: no claude or codex CLI found, nothing to configure"
+          echo "blender-mcp-register: launch manually with: uv --directory $MCP_DIR run blender-mcp"
+        fi
+
+  startup:
+    - command:
+        - setpriv
+        - --reuid=1000
+        - --regid=1000
+        - --init-groups
+        - /bin/sh
+        - -c
+        - exec /home/agent/.local/bin/blender-mcp-register >>/tmp/blender-mcp-register.log 2>&1
+      user: "0"
+      description: |
+        Point the sandbox's agent CLI at the Blender MCP server. A no-op for
+        agents without a CLI (such as the plain shell agent), in which case the
+        server is still installed and can be launched by hand.
+
+    - command:
+        - setpriv
+        - --reuid=1000
+        - --regid=1000
+        - --init-groups
+        - /bin/sh
+        - -c
+        - exec /home/agent/.local/bin/blender >>/tmp/blender-startup.log 2>&1
+      user: "0"
+      background: true
+      description: |
+        Launch Blender as a Wayland client opening the sandbox's workspace.
+        Runs as root then drops to uid 1000 via setpriv. The window appears
+        on the host compositor via the display surface provisioned by
+        --display. Backgrounded so the agent's terminal keeps focus; output
+        goes to /tmp/blender-startup.log since nothing is attached to it.
+
+# Hard-won notes for an agent driving this Blender through the MCP add-on.
+# Everything here was verified on Blender 5.0.1 / Python 3.14 in this sandbox.
+agentInstructions:
+  content: |
+    ## Exporting FBX (e.g. for Unity or Unreal)
+
+    `bpy.ops.export_scene.fbx` is BROKEN in this build and cannot be fixed from
+    the spec. Its RNA type registers only the four properties supplied by its
+    mix-ins (`filepath`, `check_existing`, `axis_forward`, `axis_up`); the
+    `BoolProperty`/`EnumProperty` annotations in the class body never reach the
+    operator, so `execute()` dies on the first one it reads:
+
+        AttributeError: 'ExportFBX' object has no attribute 'use_space_transform'
+
+    This is specific to `io_scene_fbx`. Annotation-declared properties register
+    normally elsewhere (`export_scene.gltf` has 109, `wm.obj_export` 47, and a
+    hand-written operator registers its own), so do not go looking for a Python
+    3.14 annotation problem - there isn't one. Disabling and re-enabling the
+    add-on does not help; disabling it just removes the operator entirely.
+
+    Call the add-on's backend directly instead. It works, and it takes the full
+    option set the operator was supposed to expose:
+
+        from io_scene_fbx import export_fbx_bin
+        from mathutils import Matrix
+
+        class _Op:                      # save_single() only uses .report()
+            def report(self, *a, **k): pass
+
+        export_fbx_bin.save_single(
+            _Op(), scene, depsgraph, filepath=path,
+            context_objects=list(scene.collection.objects),   # instead of use_selection
+            global_matrix=Matrix.Scale(scale, 4),
+            object_types={'EMPTY', 'MESH'},
+            use_mesh_modifiers=True, mesh_smooth_type='FACE',
+            bake_anim=False, add_leaf_bones=False, path_mode='AUTO',
+        )
+
+    `inspect.signature(export_fbx_bin.save_single)` lists every keyword and its
+    default - read it rather than guessing.
+
+    FBX *import* is fine: the new built-in `wm.fbx_import` is fully
+    parameterised (36 properties). There is no `wm.fbx_export` counterpart.
+    `wm.obj_export` (C++, 47 properties) is a working fallback when you only
+    need meshes and can rebuild the transform hierarchy on the far side.
+
+    ## Axis and scale when the target is Unity
+
+    Do NOT pre-rotate the geometry with `axis_conversion()`. Unity applies its
+    own Z-up -> Y-up conversion on import, materialising as a 270 deg X rotation
+    plus a scale on the imported root GameObject; a pre-rotation double-applies
+    and lays the model on its side. Export unrotated and Blender +Z becomes
+    Unity +Y, Blender -Y becomes Unity +Z (forward), with no mirroring.
+
+    Keep that root rotation - parent the imported model under your own
+    gameplay object rather than zeroing it.
+
+    Scale: Unity reads the file as centimetres. A `Matrix.Scale(S, 4)` of S in
+    `global_matrix` gives a model S * 0.01 Unity metres per Blender unit at the
+    importer's default Scale Factor of 1; tune the final size from the
+    ModelImporter's Scale Factor rather than re-exporting.
+
+    ## Rigs that have to survive the trip
+
+    Bone-parented or armature-driven objects do not translate cleanly. For rigid
+    blocky characters, export a plain object hierarchy whose object ORIGINS sit
+    on the joint positions - the pivots then arrive as ordinary Transforms the
+    target engine can rotate directly, with no skinning and no animation clips.
+    Re-centre a mesh on its joint with
+    `mesh.transform(Matrix.Translation(old_origin - joint))`, and bake modifiers
+    with `bpy.data.meshes.new_from_object(ob.evaluated_get(depsgraph))`.
+
+    ## MCP execution gotchas
+
+    - `execute_blender_code` requires the returned `result` to be a dict. If it
+      is not, you get an error AFTER the code has already run - the side effects
+      happened, so do not blindly re-run the whole script.
+    - `bpy.ops.wm.open_mainfile()` invalidates `bpy.context.window`, which then
+      reads as `None` for the rest of that call. Make it the last statement of a
+      call, or give it a call of its own. Fall back to
+      `bpy.data.window_managers[0].windows[0]` when you need a window afterwards.
+    - A script that renames or duplicates objects and then fails leaves the
+      session half-mutated, and the next run picks up the wreckage. Make such
+      scripts start from a known state (reopen the .blend) and assert the source
+      objects exist before touching anything.
+    - Build throwaway export rigs in a separate `bpy.data.scenes.new()` scene and
+      revert with `open_mainfile` afterwards, so the user's .blend is never
+      dirtied by export scaffolding.
+    - `render_viewport_to_path` returns a path inside Blender's own temp dir
+      rather than the path you asked for; read the `filepath` in the response and
+      copy the PNG from there.
