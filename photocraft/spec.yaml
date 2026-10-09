@@ -137,6 +137,11 @@ setup:
         LAUNCH_DIR="$WORKSPACE_DIR"
         if [ -z "$LAUNCH_DIR" ]; then LAUNCH_DIR="$HOME_DIR"; fi
         cd "$LAUNCH_DIR" || exit 1
+        # Automation (the control channel, so the agent) can read and write files only
+        # under these roots; without them doc_open/doc_save/doc_export are all refused.
+        # The app reads both variables itself.
+        export PHOTOCRAFT_AUTOMATION_READ_ROOT="${PHOTOCRAFT_AUTOMATION_READ_ROOT:-$LAUNCH_DIR}"
+        export PHOTOCRAFT_AUTOMATION_WRITE_ROOT="${PHOTOCRAFT_AUTOMATION_WRITE_ROOT:-$LAUNCH_DIR}"
         exec /opt/photocraft/bin/photocraft --control "$PORT" --control-token-file "$STATE_DIR/control.token" "$@"
         LAUNCH
 
@@ -148,6 +153,10 @@ setup:
         MODE="${PHOTOCRAFT_MCP_MODE:-auto}"
         WAIT="${PHOTOCRAFT_MCP_WAIT:-20}"
         TOKEN_FILE="$HOME/.local/state/photocraft/control.token"
+        # File roots for the headless engine (it ignores the environment variables, so
+        # they are passed as flags). In bridge mode the desktop app's roots apply.
+        READ_ROOT="${PHOTOCRAFT_AUTOMATION_READ_ROOT:-${WORKSPACE_DIR:-$PWD}}"
+        WRITE_ROOT="${PHOTOCRAFT_AUTOMATION_WRITE_ROOT:-${WORKSPACE_DIR:-$PWD}}"
 
         port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
         ready() { port_open && [ -s "$TOKEN_FILE" ]; }
@@ -157,7 +166,7 @@ setup:
         }
         headless() {
           echo "photocraft-mcp: headless (no window)" >&2
-          exec "$CLI" mcp "$@"
+          exec "$CLI" mcp --automation-read-root "$READ_ROOT" --automation-write-root "$WRITE_ROOT" "$@"
         }
 
         [ "$MODE" = headless ] && headless "$@"
@@ -278,8 +287,11 @@ agentInstructions:
       rather than guessing parameters.
     - Look at the result (the server's render or screenshot tool) after visual
       changes instead of assuming they worked.
-    - Always pass ABSOLUTE paths for opening, saving, importing and exporting. The
-      app's working directory is the workspace, but the MCP server's may differ.
+    - File paths are RELATIVE to the workspace (`art/knight.pcraft`, not
+      `/workspace/art/knight.pcraft`). PhotoCraft only lets automation touch files
+      under its read and write roots, which this kit sets to the workspace; absolute
+      paths, `..` and symlinks out of it are rejected. The parent folder of a new
+      file must already exist, so create it from the shell first.
     - Save to the workspace so the user keeps the file.
     - The app's native file dialogs do not work in the sandbox. Never open
       Open/Save/Import dialogs through menus; use the path-taking tools instead.

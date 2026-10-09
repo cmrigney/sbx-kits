@@ -54,6 +54,11 @@ The control channel is authenticated: the app creates a bearer token in
 `~/.local/state/photocraft/control.token` (mode 0600) on first launch, and the MCP
 server reads the same file.
 
+PhotoCraft automation can only read and write files under its read and write roots. This kit
+sets both to the workspace, so the agent passes paths relative to it. Override them with
+`PHOTOCRAFT_AUTOMATION_READ_ROOT` / `PHOTOCRAFT_AUTOMATION_WRITE_ROOT` (they must be set
+where the app starts, since in connected mode the app's roots are the ones that apply).
+
 ## Limitations
 
 - The app's Open, Save and Import dialogs don't work inside the sandbox. Use the MCP tools
