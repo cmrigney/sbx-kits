@@ -1,7 +1,7 @@
 schemaVersion: "2"
 kind: mixin
-name: designcraft
-displayName: DesignCraft
+name: soundcraft
+displayName: SoundCraft
 permissions:
   network:
     allow:
@@ -18,6 +18,10 @@ setup:
     # supplies a software Vulkan device; the EGL/GL packages are wgpu's GL
     # fallback. All of this is only used when the sandbox has --display; the
     # headless MCP server needs none of it.
+    #
+    # The desktop app links libasound directly, so it will not start without
+    # libasound2t64. The sandbox has no sound device: playback is silent, but
+    # rendering and exporting audio to files works.
     - command: |
         set -eux
         export DEBIAN_FRONTEND=noninteractive
@@ -36,41 +40,42 @@ setup:
           libgl1 \
           libgles2 \
           libgbm1 \
-          libgl1-mesa-dri
+          libgl1-mesa-dri \
+          libasound2t64
         rm -rf /var/lib/apt/lists/*
 
-    # DesignCraft from the upstream GitHub release. The Linux tarball ships both the
-    # desktop app (`designcraft`) and the CLI (`designcraft-cli`) that hosts the MCP
+    # SoundCraft from the upstream GitHub release. The Linux tarball ships both the
+    # desktop app (`soundcraft`) and the CLI (`soundcraft-cli`) that hosts the MCP
     # server. Pinned and checksum-verified against the release's SHA256SUMS.txt.
     - command: |
         set -eux
-        VERSION=0.4.0
+        VERSION=0.3.0
         case "$(uname -m)" in
           aarch64|arm64) ARCH=aarch64 ;;
           x86_64|amd64)  ARCH=x86_64 ;;
-          *) echo "designcraft: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+          *) echo "soundcraft: unsupported architecture $(uname -m)" >&2; exit 1 ;;
         esac
-        NAME="designcraft-$VERSION-linux-$ARCH"
-        BASE="https://github.com/storytold/designcraft/releases/download/v$VERSION"
+        NAME="soundcraft-$VERSION-linux-$ARCH"
+        BASE="https://github.com/storytold/soundcraft/releases/download/v$VERSION"
         TMP=$(mktemp -d)
         curl -fsSL -o "$TMP/$NAME.tar.gz" "$BASE/$NAME.tar.gz"
         curl -fsSL -o "$TMP/SHA256SUMS.txt" "$BASE/SHA256SUMS.txt"
         (cd "$TMP" && grep " \*\?$NAME.tar.gz\$" SHA256SUMS.txt | sha256sum -c -)
-        rm -rf /opt/designcraft
-        mkdir -p /opt/designcraft
-        tar -xzf "$TMP/$NAME.tar.gz" -C /opt/designcraft --strip-components=1 --no-same-owner
+        rm -rf /opt/soundcraft
+        mkdir -p /opt/soundcraft
+        tar -xzf "$TMP/$NAME.tar.gz" -C /opt/soundcraft --strip-components=1 --no-same-owner
         rm -rf "$TMP"
-        ln -sf /opt/designcraft/bin/designcraft-cli /usr/local/bin/designcraft-cli
-        /usr/local/bin/designcraft-cli --version
+        ln -sf /opt/soundcraft/bin/soundcraft-cli /usr/local/bin/soundcraft-cli
+        /usr/local/bin/soundcraft-cli --version
 
     # Launchers. Written here rather than under `files:` because init files are
     # written after install commands run, and the MCP launcher has to exist
     # before the agent CLI is first started.
     #
-    # `designcraft` opens the desktop app on the sandbox display with its control
-    # channel on 127.0.0.1:7979, which is what the MCP server's connected mode talks to.
+    # `soundcraft` opens the desktop app on the sandbox display with its control
+    # channel on 127.0.0.1:7801, which is what the MCP server's connected mode talks to.
     #
-    # `designcraft-mcp` is the command the agent CLI spawns. It picks the mode when it
+    # `soundcraft-mcp` is the command the agent CLI spawns. It picks the mode when it
     # starts: if the sandbox has a display it waits for the app's control port and
     # drives the live window (the user sees every change, and the window-only tools
     # work); otherwise, or if the app never comes up, it runs the in-process headless
@@ -78,14 +83,14 @@ setup:
     # mode fails fast when nothing is listening, hence the wait.
     - command: |
         set -eux
-        cat > /usr/local/bin/designcraft <<'LAUNCH'
+        cat > /usr/local/bin/soundcraft <<'LAUNCH'
         #!/bin/sh
         DISPLAY_DIR=/run/display
         DISPLAY_SOCK=wayland-0
         if [ ! -S "$DISPLAY_DIR/$DISPLAY_SOCK" ]; then
-          echo "designcraft: display socket not found at $DISPLAY_DIR/$DISPLAY_SOCK" >&2
+          echo "soundcraft: display socket not found at $DISPLAY_DIR/$DISPLAY_SOCK" >&2
           echo "This sandbox was not created with --display, so the desktop app cannot open." >&2
-          echo "The MCP server still works headless (designcraft-cli mcp)." >&2
+          echo "The MCP server still works headless (soundcraft-cli mcp)." >&2
           echo "" >&2
           echo "To get the window, enable the experimental display feature and recreate:" >&2
           echo "  sbx settings set platform.allowExperimentalFeatures true" >&2
@@ -95,11 +100,11 @@ setup:
         fi
         HOME_DIR=$(getent passwd 1000 | cut -d: -f6)
         if [ -z "$HOME_DIR" ]; then
-          echo "designcraft: no user at uid 1000" >&2
+          echo "soundcraft: no user at uid 1000" >&2
           exit 1
         fi
         export HOME="$HOME_DIR"
-        PORT="${DESIGNCRAFT_CONTROL_PORT:-7979}"
+        PORT="${SOUNDCRAFT_CONTROL_PORT:-7801}"
         # A relative WAYLAND_DISPLAY resolved against XDG_RUNTIME_DIR works on
         # every libwayland; bare absolute socket paths need libwayland >= 1.21.
         export XDG_RUNTIME_DIR="$DISPLAY_DIR"
@@ -109,25 +114,25 @@ setup:
         LAUNCH_DIR="$WORKSPACE_DIR"
         if [ -z "$LAUNCH_DIR" ]; then LAUNCH_DIR="$HOME_DIR"; fi
         cd "$LAUNCH_DIR" || exit 1
-        exec /opt/designcraft/bin/designcraft --control "$PORT" "$@"
+        exec /opt/soundcraft/bin/soundcraft --control "$PORT" "$@"
         LAUNCH
 
-        cat > /usr/local/bin/designcraft-mcp <<'MCP'
+        cat > /usr/local/bin/soundcraft-mcp <<'MCP'
         #!/bin/bash
-        # DESIGNCRAFT_MCP_MODE: auto (default), app, or headless.
-        CLI=/opt/designcraft/bin/designcraft-cli
-        PORT="${DESIGNCRAFT_CONTROL_PORT:-7979}"
-        MODE="${DESIGNCRAFT_MCP_MODE:-auto}"
-        WAIT="${DESIGNCRAFT_MCP_WAIT:-20}"
+        # SOUNDCRAFT_MCP_MODE: auto (default), app, or headless.
+        CLI=/opt/soundcraft/bin/soundcraft-cli
+        PORT="${SOUNDCRAFT_CONTROL_PORT:-7801}"
+        MODE="${SOUNDCRAFT_MCP_MODE:-auto}"
+        WAIT="${SOUNDCRAFT_MCP_WAIT:-20}"
 
         port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
         ready() { port_open; }
         connect() {
-          echo "designcraft-mcp: driving the DesignCraft app on 127.0.0.1:$PORT" >&2
+          echo "soundcraft-mcp: driving the SoundCraft app on 127.0.0.1:$PORT" >&2
           exec "$CLI" mcp --connect "$PORT" "$@"
         }
         headless() {
-          echo "designcraft-mcp: headless (no window)" >&2
+          echo "soundcraft-mcp: headless (no window)" >&2
           exec "$CLI" mcp "$@"
         }
 
@@ -138,11 +143,11 @@ setup:
             sleep 1
           done
           ready && connect "$@"
-          echo "designcraft-mcp: no DesignCraft app on 127.0.0.1:$PORT after ${WAIT}s" >&2
+          echo "soundcraft-mcp: no SoundCraft app on 127.0.0.1:$PORT after ${WAIT}s" >&2
         fi
         headless "$@"
         MCP
-        chmod 0755 /usr/local/bin/designcraft /usr/local/bin/designcraft-mcp
+        chmod 0755 /usr/local/bin/soundcraft /usr/local/bin/soundcraft-mcp
 
     # Register the server with the sandbox's agent CLI at install time: install
     # commands finish during `sbx create`, before the CLI attaches, while startup
@@ -151,18 +156,18 @@ setup:
         set -e
         BIN_DIR="$HOME/.local/bin"
         mkdir -p "$BIN_DIR"
-        cat > "$BIN_DIR/designcraft-mcp-register" <<'REGISTER'
+        cat > "$BIN_DIR/soundcraft-mcp-register" <<'REGISTER'
         #!/bin/sh
         # Strictly additive: never remove-then-add. `claude mcp add` exits 1 on an
         # existing name, so a re-run is expected to fail and `|| true` leaves the
         # existing entry alone.
         PATH="$HOME/.local/bin:$HOME/.claude/local:/usr/local/share/npm-global/bin:$PATH"
         export PATH
-        NAME=designcraft
-        CMD=/usr/local/bin/designcraft-mcp
+        NAME=soundcraft
+        CMD=/usr/local/bin/soundcraft-mcp
 
         if [ ! -x "$CMD" ]; then
-          echo "designcraft-mcp-register: $CMD is missing" >&2
+          echo "soundcraft-mcp-register: $CMD is missing" >&2
           exit 1
         fi
 
@@ -170,20 +175,20 @@ setup:
         if command -v claude >/dev/null 2>&1; then
           found=1
           claude mcp add --scope user "$NAME" -- "$CMD" || true
-          echo "designcraft-mcp-register: claude registration attempted for '$NAME'"
+          echo "soundcraft-mcp-register: claude registration attempted for '$NAME'"
         fi
         if command -v codex >/dev/null 2>&1; then
           found=1
           codex mcp add "$NAME" -- "$CMD" || true
-          echo "designcraft-mcp-register: codex registration attempted for '$NAME'"
+          echo "soundcraft-mcp-register: codex registration attempted for '$NAME'"
         fi
         if [ "$found" -eq 0 ]; then
-          echo "designcraft-mcp-register: no claude or codex CLI found, nothing to configure"
-          echo "designcraft-mcp-register: launch manually with: $CMD"
+          echo "soundcraft-mcp-register: no claude or codex CLI found, nothing to configure"
+          echo "soundcraft-mcp-register: launch manually with: $CMD"
         fi
         REGISTER
-        chmod 0755 "$BIN_DIR/designcraft-mcp-register"
-        "$BIN_DIR/designcraft-mcp-register"
+        chmod 0755 "$BIN_DIR/soundcraft-mcp-register"
+        "$BIN_DIR/soundcraft-mcp-register"
       user: "agent"
 
   startup:
@@ -191,10 +196,10 @@ setup:
     - command:
         - sh
         - -c
-        - /home/agent/.local/bin/designcraft-mcp-register >>/tmp/designcraft-mcp-register.log 2>&1 || true
+        - /home/agent/.local/bin/soundcraft-mcp-register >>/tmp/soundcraft-mcp-register.log 2>&1 || true
       user: "agent"
       description: |
-        Re-point the sandbox's agent CLI at the DesignCraft MCP server. A no-op for
+        Re-point the sandbox's agent CLI at the SoundCraft MCP server. A no-op for
         agents without a CLI (such as the plain shell agent).
 
     - command:
@@ -206,33 +211,33 @@ setup:
         - -c
         - |
           if [ -S /run/display/wayland-0 ]; then
-            exec /usr/local/bin/designcraft >>/tmp/designcraft-startup.log 2>&1
+            exec /usr/local/bin/soundcraft >>/tmp/soundcraft-startup.log 2>&1
           fi
-          echo "no display; not starting the DesignCraft window (MCP runs headless)" >>/tmp/designcraft-startup.log
+          echo "no display; not starting the SoundCraft window (MCP runs headless)" >>/tmp/soundcraft-startup.log
       user: "0"
       background: true
       description: |
-        Launch DesignCraft as a Wayland client with its control channel on
-        127.0.0.1:7979, when the sandbox was created with --display. Runs as
+        Launch SoundCraft as a Wayland client with its control channel on
+        127.0.0.1:7801, when the sandbox was created with --display. Runs as
         root then drops to uid 1000 via setpriv. Backgrounded so the agent's
-        terminal keeps focus; output goes to /tmp/designcraft-startup.log.
+        terminal keeps focus; output goes to /tmp/soundcraft-startup.log.
 
 agentInstructions:
   content: |
-    ## DesignCraft
+    ## SoundCraft
 
-    DesignCraft (page layout and publishing, in the style of InDesign) is installed,
-    and its MCP server is registered as `designcraft`. The server's own
+    SoundCraft (recording, editing and mixing audio, in the style of Pro Tools) is
+    installed, and its MCP server is registered as `soundcraft`. The server's own
     `instructions` describe its tools; these notes cover how it is set up in this
-    sandbox. Upstream: https://github.com/storytold/designcraft
+    sandbox. Upstream: https://github.com/storytold/soundcraft
 
     ### Which mode you are in
 
     The server logs its mode to stderr when it starts, and window-only tools say so
     when they fail:
 
-    - **Connected** (sandbox has `--display`): you are driving the DesignCraft window
-      the user can see, over its control channel on 127.0.0.1:7979. Everything you
+    - **Connected** (sandbox has `--display`): you are driving the SoundCraft window
+      the user can see, over its control channel on 127.0.0.1:7801. Everything you
       do shows up live, and the window tools (screenshots, clicks, menus, dialogs)
       work.
     - **Headless** (no display, or the app was not up within 20 s of the MCP server
@@ -240,7 +245,7 @@ agentInstructions:
       return an error.
 
     If the user closed the window, the connected server cannot reach the app.
-    Relaunch it with `designcraft >>/tmp/designcraft-startup.log 2>&1 &` from the shell; the
+    Relaunch it with `soundcraft >>/tmp/soundcraft-startup.log 2>&1 &` from the shell; the
     server reconnects on the next call.
 
     ### Working well
@@ -254,15 +259,5 @@ agentInstructions:
     - Save to the workspace so the user keeps the file.
     - The app's native file dialogs do not work in the sandbox. Never open
       Open/Save/Import dialogs through menus; use the path-taking tools instead.
-
-    ### DesignCraft specifics
-
-    - Coordinates are points (1/72 in), y down, in spread space. A Letter page
-      is 612 x 792. `inspect_document` lists page bounds and item ids.
-    - Use `batch` for several steps, with `"$N.path"` to reference earlier
-      results (e.g. the id a `frame.create` returned).
-    - Look for overset text in `inspect_document` / `get_story` after layout
-      changes.
-    - `save_document` writes native `.designcraft`; `execute file.exportPdf
-      {path}` writes PDF; `export_png` writes a page image; IDML import and
-      export are also available.
+    - The sandbox has no sound device. Playback is silent; render or export
+      audio to a file to check it.

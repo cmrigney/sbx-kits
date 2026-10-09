@@ -1,14 +1,12 @@
 # DesignCraft kit
 
-An sbx mixin that installs [DesignCraft](https://github.com/storytold/designcraft)
-(an open-source page-layout app in the style of InDesign) in the sandbox and registers its
-[MCP server](https://github.com/storytold/designcraft/blob/main/docs/mcp.md) with the agent,
-so the agent can lay out, edit and export documents.
+An sbx mixin that installs [DesignCraft](https://github.com/storytold/designcraft) (page
+layout and publishing, in the style of InDesign) in the sandbox and registers its MCP
+server with the agent.
 
 ## Usage
 
-Headless: no display needed. The agent gets every document tool and checks its work
-with `render_page`:
+Headless: no display needed. The agent gets every document tool and renders to check its work:
 
 ```sh
 sbx run --kit "git+https://github.com/cmrigney/sbx-kits.git#dir=designcraft" claude .
@@ -22,25 +20,24 @@ sbx settings set feature.sandbox-display true              # once
 sbx run --display --kit "git+https://github.com/cmrigney/sbx-kits.git#dir=designcraft" claude .
 ```
 
-With `--display`, DesignCraft starts on the workspace directory with its control
-channel on `127.0.0.1:7979`, and the MCP server drives that window. This also turns on
-the window-only tools (`screenshot`, `click`, `menu_list`, `dialog_*`, …).
+With `--display`, DesignCraft starts on the workspace directory with its control channel on
+`127.0.0.1:7979`, and the MCP server drives that window. This also turns on the
+window-only tools (screenshots, clicks, menus, dialogs).
 
 ## What you get
 
 - DesignCraft 0.4.0 from the upstream release (arm64 or x86_64, checksum-verified),
   in `/opt/designcraft`
 - `designcraft`: opens the app on the sandbox display with the control channel turned on
-- `designcraft-cli`: the upstream CLI (headless render, scripting, `mcp`)
+- `designcraft-cli`: the upstream CLI (headless rendering, scripting, `mcp`)
 - `designcraft-mcp`: the MCP server registered as `designcraft` with `claude` or `codex`
 - Software rendering through Mesa lavapipe (Vulkan) and llvmpipe. No GPU needed.
 
 ## How the MCP mode is chosen
 
-The agent CLI launches `designcraft-mcp` when it starts. If the sandbox has a display,
-the script waits up to 20 s for the app's control port, then connects to it. Otherwise,
-or if the app never comes up, it runs headless. You can override this with
-environment variables:
+The agent CLI launches `designcraft-mcp` when it starts. If the sandbox has a display, the script
+waits up to 20 s for the app's control port, then connects to it. Otherwise, or if the app
+never comes up, it runs headless. You can override this with environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -48,12 +45,14 @@ environment variables:
 | `DESIGNCRAFT_MCP_WAIT` | `20` | Seconds to wait for the app |
 | `DESIGNCRAFT_CONTROL_PORT` | `7979` | Control port used by both the app and the MCP server |
 
-If you close the window, relaunch it from the sandbox shell with `designcraft &`.
-The MCP server reconnects on its next call.
+The default port is unique across these kits, so you can stack several in one sandbox.
+
+If you close the window, relaunch it from the sandbox shell with `designcraft &`. The MCP server
+reconnects on its next call.
 
 ## Limitations
 
-- The app's Open, Save and Place dialogs don't work inside the sandbox. Use the MCP tools
+- The app's Open, Save and Import dialogs don't work inside the sandbox. Use the MCP tools
   or `designcraft-cli` with file paths instead.
 - Only Wayland is supported. The launcher unsets `DISPLAY` because there is no X server,
   which means files can't be dragged and dropped onto the window.

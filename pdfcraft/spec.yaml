@@ -1,0 +1,221 @@
+schemaVersion: "2"
+kind: mixin
+name: pdfcraft
+displayName: PdfCraft
+permissions:
+  network:
+    allow:
+      # Release tarball: github.com redirects to the release-assets CDN.
+      - github.com:443
+      - release-assets.githubusercontent.com:443
+      - objects.githubusercontent.com:443
+setup:
+  install:
+    # The prebuilt release links only against libc/libm/libgcc_s; everything
+    # graphical is loaded with dlopen at runtime, so apt has to be told about it.
+    # winit needs libwayland-client and libxkbcommon. The UI renders through
+    # wgpu, and the sandbox has no GPU, so Mesa's lavapipe (mesa-vulkan-drivers)
+    # supplies a software Vulkan device; the EGL/GL packages are wgpu's GL
+    # fallback. All of this is only used when the sandbox has --display; the
+    # headless MCP server needs none of it.
+    - command: |
+        set -eux
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y \
+          ca-certificates \
+          curl \
+          libwayland-client0 \
+          libwayland-cursor0 \
+          libwayland-egl1 \
+          libxkbcommon0 \
+          libvulkan1 \
+          mesa-vulkan-drivers \
+          libegl1 \
+          libegl-mesa0 \
+          libgl1 \
+          libgles2 \
+          libgbm1 \
+          libgl1-mesa-dri
+        rm -rf /var/lib/apt/lists/*
+
+    # PdfCraft from the upstream GitHub release. The Linux tarball ships both the
+    # desktop app (`pdfcraft`) and the CLI (`pdfcraft-cli`) that hosts the MCP
+    # server. Pinned and checksum-verified against the release's SHA256SUMS.txt.
+    - command: |
+        set -eux
+        VERSION=0.4.0
+        case "$(uname -m)" in
+          aarch64|arm64) ARCH=aarch64 ;;
+          x86_64|amd64)  ARCH=x86_64 ;;
+          *) echo "pdfcraft: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+        esac
+        NAME="pdfcraft-$VERSION-linux-$ARCH"
+        BASE="https://github.com/storytold/pdfcraft/releases/download/v$VERSION"
+        TMP=$(mktemp -d)
+        curl -fsSL -o "$TMP/$NAME.tar.gz" "$BASE/$NAME.tar.gz"
+        curl -fsSL -o "$TMP/SHA256SUMS.txt" "$BASE/SHA256SUMS.txt"
+        (cd "$TMP" && grep " \*\?$NAME.tar.gz\$" SHA256SUMS.txt | sha256sum -c -)
+        rm -rf /opt/pdfcraft
+        mkdir -p /opt/pdfcraft
+        tar -xzf "$TMP/$NAME.tar.gz" -C /opt/pdfcraft --strip-components=1 --no-same-owner
+        rm -rf "$TMP"
+        ln -sf /opt/pdfcraft/bin/pdfcraft-cli /usr/local/bin/pdfcraft-cli
+        /usr/local/bin/pdfcraft-cli --version
+
+    # Launchers. Written here rather than under `files:` because init files are
+    # written after install commands run, and the MCP launcher has to exist
+    # before the agent CLI is first started.
+    #
+    # `pdfcraft` opens the desktop app on the sandbox display. Its `--control FILE`
+    # channel is for `pdfcraft-cli ui --control /home/agent/.local/state/pdfcraft/control.json …` (window
+    # inspection, clicks, screenshots) from the shell; the MCP server does not use it.
+    #
+    # `pdfcraft-mcp` is the command the agent CLI spawns: PdfCraft's MCP server is
+    # headless only, so it always runs the in-process engine, confined to the
+    # workspace.
+    - command: |
+        set -eux
+        cat > /usr/local/bin/pdfcraft <<'LAUNCH'
+        #!/bin/sh
+        DISPLAY_DIR=/run/display
+        DISPLAY_SOCK=wayland-0
+        if [ ! -S "$DISPLAY_DIR/$DISPLAY_SOCK" ]; then
+          echo "pdfcraft: display socket not found at $DISPLAY_DIR/$DISPLAY_SOCK" >&2
+          echo "This sandbox was not created with --display, so the desktop app cannot open." >&2
+          echo "The MCP server still works headless (pdfcraft-cli mcp)." >&2
+          echo "" >&2
+          echo "To get the window, enable the experimental display feature and recreate:" >&2
+          echo "  sbx settings set platform.allowExperimentalFeatures true" >&2
+          echo "  sbx settings set feature.sandbox-display true" >&2
+          echo "  sbx create --display --kit <this-kit> shell <workspace>" >&2
+          exit 1
+        fi
+        HOME_DIR=$(getent passwd 1000 | cut -d: -f6)
+        if [ -z "$HOME_DIR" ]; then
+          echo "pdfcraft: no user at uid 1000" >&2
+          exit 1
+        fi
+        export HOME="$HOME_DIR"
+        STATE_DIR="$HOME/.local/state/pdfcraft"
+        mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+        # A relative WAYLAND_DISPLAY resolved against XDG_RUNTIME_DIR works on
+        # every libwayland; bare absolute socket paths need libwayland >= 1.21.
+        export XDG_RUNTIME_DIR="$DISPLAY_DIR"
+        export WAYLAND_DISPLAY="$DISPLAY_SOCK"
+        # The app switches to X11 whenever DISPLAY is set; there is no X server.
+        unset DISPLAY
+        LAUNCH_DIR="$WORKSPACE_DIR"
+        if [ -z "$LAUNCH_DIR" ]; then LAUNCH_DIR="$HOME_DIR"; fi
+        cd "$LAUNCH_DIR" || exit 1
+        exec /opt/pdfcraft/bin/pdfcraft --control "$STATE_DIR/control.json" "$@"
+        LAUNCH
+
+        cat > /usr/local/bin/pdfcraft-mcp <<'MCP'
+        #!/bin/bash
+        # PdfCraft's MCP server is headless only; it never talks to the desktop app.
+        # PDFCRAFT_MCP_ROOT confines every file it reads or writes (default: the workspace).
+        CLI=/opt/pdfcraft/bin/pdfcraft-cli
+        ROOT="${PDFCRAFT_MCP_ROOT:-${WORKSPACE_DIR:-$PWD}}"
+        echo "pdfcraft-mcp: headless, file access confined to $ROOT" >&2
+        exec "$CLI" mcp --root "$ROOT" "$@"
+        MCP
+        chmod 0755 /usr/local/bin/pdfcraft /usr/local/bin/pdfcraft-mcp
+
+    # Register the server with the sandbox's agent CLI at install time: install
+    # commands finish during `sbx create`, before the CLI attaches, while startup
+    # commands can fire after the session has already read its MCP config.
+    - command: |
+        set -e
+        BIN_DIR="$HOME/.local/bin"
+        mkdir -p "$BIN_DIR"
+        cat > "$BIN_DIR/pdfcraft-mcp-register" <<'REGISTER'
+        #!/bin/sh
+        # Strictly additive: never remove-then-add. `claude mcp add` exits 1 on an
+        # existing name, so a re-run is expected to fail and `|| true` leaves the
+        # existing entry alone.
+        PATH="$HOME/.local/bin:$HOME/.claude/local:/usr/local/share/npm-global/bin:$PATH"
+        export PATH
+        NAME=pdfcraft
+        CMD=/usr/local/bin/pdfcraft-mcp
+
+        if [ ! -x "$CMD" ]; then
+          echo "pdfcraft-mcp-register: $CMD is missing" >&2
+          exit 1
+        fi
+
+        found=0
+        if command -v claude >/dev/null 2>&1; then
+          found=1
+          claude mcp add --scope user "$NAME" -- "$CMD" || true
+          echo "pdfcraft-mcp-register: claude registration attempted for '$NAME'"
+        fi
+        if command -v codex >/dev/null 2>&1; then
+          found=1
+          codex mcp add "$NAME" -- "$CMD" || true
+          echo "pdfcraft-mcp-register: codex registration attempted for '$NAME'"
+        fi
+        if [ "$found" -eq 0 ]; then
+          echo "pdfcraft-mcp-register: no claude or codex CLI found, nothing to configure"
+          echo "pdfcraft-mcp-register: launch manually with: $CMD"
+        fi
+        REGISTER
+        chmod 0755 "$BIN_DIR/pdfcraft-mcp-register"
+        "$BIN_DIR/pdfcraft-mcp-register"
+      user: "agent"
+
+  startup:
+    # Fallback only; see the install-time registration above.
+    - command:
+        - sh
+        - -c
+        - /home/agent/.local/bin/pdfcraft-mcp-register >>/tmp/pdfcraft-mcp-register.log 2>&1 || true
+      user: "agent"
+      description: |
+        Re-point the sandbox's agent CLI at the PdfCraft MCP server. A no-op for
+        agents without a CLI (such as the plain shell agent).
+
+    - command:
+        - setpriv
+        - --reuid=1000
+        - --regid=1000
+        - --init-groups
+        - /bin/sh
+        - -c
+        - |
+          if [ -S /run/display/wayland-0 ]; then
+            exec /usr/local/bin/pdfcraft >>/tmp/pdfcraft-startup.log 2>&1
+          fi
+          echo "no display; not starting the PdfCraft window" >>/tmp/pdfcraft-startup.log
+      user: "0"
+      background: true
+      description: |
+        Launch PdfCraft as a Wayland client when the sandbox was created with
+        --display. Runs as root then drops to uid 1000 via setpriv.
+        Backgrounded so the agent's terminal keeps focus; output goes to
+        /tmp/pdfcraft-startup.log.
+
+agentInstructions:
+  content: |
+    ## PdfCraft
+
+    PdfCraft (reading, organizing and protecting PDFs, in the style of Acrobat) is
+    installed, and its MCP server is registered as `pdfcraft`. The server's own
+    `instructions` describe its tools; these notes cover how it is set up in this
+    sandbox. Upstream: https://github.com/storytold/pdfcraft
+
+    ### How it is set up
+
+    - The MCP server is headless: it never drives the window the user sees. Its file
+      access is confined to the workspace (`--root`), so use paths inside it.
+      Paths outside the workspace are rejected; put inputs there first.
+    - If the sandbox has `--display`, the PdfCraft window is open as well, with a
+      control file at `/home/agent/.local/state/pdfcraft/control.json`. Drive or inspect it from the shell:
+
+          pdfcraft-cli ui --control /home/agent/.local/state/pdfcraft/control.json inspect query=rotate
+          pdfcraft-cli ui --control /home/agent/.local/state/pdfcraft/control.json screenshot --out /tmp/w.png
+
+      Relaunch a closed window with `pdfcraft >>/tmp/pdfcraft-startup.log 2>&1 &`.
+    - `pdfcraft-cli` also does one-shot jobs (`info`, `render`, `text`, `combine`,
+      `extract`, `split`, `edit`); see `pdfcraft-cli --help`.
+    - The app's native file dialogs do not work in the sandbox. Open files by path.
